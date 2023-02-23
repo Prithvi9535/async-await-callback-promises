@@ -1,0 +1,386 @@
+const AWS = require('aws-sdk');
+var lambda = new AWS.Lambda();
+var docClient = new AWS.DynamoDB.DocumentClient();
+require('./patch.js');
+
+const query_dynamo = async (params) => {
+    try {
+        let data = await docClient.query(params).promise();
+        return data;
+    }
+    catch (err) {
+        console.log(params, err);
+        throw new Error(err);
+    }
+};
+
+exports.handler = async (event) => {
+    console.log("event", event);
+    // console.log(event);
+    // const apigwManagementApi = new AWS.ApiGatewayManagementApi({
+    //     apiVersion: '2018-11-29',
+    //     endpoint: "lnuzjftr1a.execute-api.ap-south-1.amazonaws.com/chainhome"
+    // });
+    let getOrganizationDetailsParams = {
+        TableName: 'dev_KPRO_organizations',
+        KeyConditionExpression: 'organization_id = :organization_id',
+        ExpressionAttributeValues: {
+            ':organization_id': event.organization_id
+        }
+    };
+    let organization = await query_dynamo(getOrganizationDetailsParams);
+    if (organization.Count > 0) {
+        let getAssetDetailsParams = {
+            TableName: 'dev_KPRO_Assests',
+            KeyConditionExpression: 'asset_id = :asset_id',
+            ExpressionAttributeValues: {
+                ':asset_id': event.asset_id
+            }
+        };
+        let asset = await query_dynamo(getAssetDetailsParams);
+        if (asset.Count > 0) {
+            //WEBSOCKET USERS
+            let op_response = [];
+            let summary_response = [];
+            //OP PARAMS
+            let getAllOperationalParametersParams = {
+                TableName: "dev_KPRO_organization_tags",
+                IndexName: 'organization_id__dashboard_id-asset_id-index',
+                KeyConditionExpression: 'organization_id__dashboard_id = :organization_id__dashboard_id AND asset_id = :asset_id',
+                FilterExpression: "tag_type = :tag_type OR tag_type = :2ndtag_type",
+                ExpressionAttributeValues: {
+                    ':organization_id__dashboard_id': event.organization_id + "__" + event.dashboard_id,
+                    ':asset_id': event.asset_id,
+                    ':tag_type': "AI",
+                    ':2ndtag_type': 'AO'
+                }
+            };
+            let operational_parameters = await query_dynamo(getAllOperationalParametersParams);
+            if (operational_parameters.Count > 0) {
+                operational_parameters.Items = operational_parameters.Items.map(item => {
+                    item.type = "OPERATIONAL_PARAMETER";
+                    return item;
+                });
+                for (let i = 0; i < operational_parameters.Items.length; i++) {
+                    let letGetLatestRecord = {
+                        TableName: "dev_kpro_chainhome_master",
+                        KeyConditionExpression: 'kpch_tag = :kpch_tag',
+                        ExpressionAttributeValues: {
+                            ':kpch_tag': organization.Items[0].organization_code + asset.Items[0].asset_type + "_" + operational_parameters.Items[i].tag_id
+                        },
+                        ScanIndexForward: false,
+                        Limit: 1
+                    };
+                    const latestRecord = await query_dynamo(letGetLatestRecord);
+                    operational_parameters.Items[i].actual_value = latestRecord.Count > 0 ? latestRecord.Items[0].kpch_val.toFixed(2) : "0.00";
+                }
+                op_response = operational_parameters.Items;
+            }
+
+            //SUMMARY PARAMETERS
+            let getAllSummaryParametersParams = {
+                TableName: "dev_KPRO_organization_tags",
+                IndexName: 'organization_id__dashboard_id-asset_id-index',
+                KeyConditionExpression: 'organization_id__dashboard_id = :organization_id__dashboard_id AND asset_id = :asset_id',
+                FilterExpression: "tag_type <> :tag_type",
+                ExpressionAttributeValues: {
+                    ':organization_id__dashboard_id': event.organization_id + "__" + event.dashboard_id,
+                    ':asset_id': event.asset_id,
+                    ':tag_type': "AI"
+                }
+            };
+            let summary_parameters = await query_dynamo(getAllSummaryParametersParams);
+            for (let i = 0; i < summary_parameters.Items.length; i++) {
+                let tag = summary_parameters.Items[i];
+                let getMasterTagDetailsParams = {
+                    TableName: 'dev_KPRO_MasterParameters',
+                    KeyConditionExpression: 'tag_id = :tag_id',
+                    ExpressionAttributeValues: {
+                        ':tag_id': summary_parameters.Items[i].tag_id
+                    }
+                };
+                let master_tag = await query_dynamo(getMasterTagDetailsParams);
+                if (tag.tag_type == "DI" || tag.tag_type == "DO") {
+                    if (master_tag.Count > 0) {
+                        if (master_tag.Items[0].parameter_values) {
+                            let letGetLatestRecord = {
+                                TableName: "dev_kpro_chainhome_master",
+                                KeyConditionExpression: 'kpch_tag = :kpch_tag',
+                                ExpressionAttributeValues: {
+                                    ':kpch_tag': organization.Items[0].organization_code + asset.Items[0].asset_type + "_" + summary_parameters.Items[i].tag_id
+                                },
+                                ScanIndexForward: false,
+                                Limit: 1
+                            };
+                            let latestRecord = await query_dynamo(letGetLatestRecord);
+                            //console.log("latestRecord", latestRecord);
+                            if (latestRecord.Count == 0) {
+                                let letGetLatestRecord = {
+                                    TableName: "dev_kpro_chainhome_alarms",
+                                    KeyConditionExpression: 'kpch_tag = :kpch_tag',
+                                    ExpressionAttributeValues: {
+                                        ':kpch_tag': organization.Items[0].organization_code + asset.Items[0].asset_type + "_" + summary_parameters.Items[i].tag_id
+                                    },
+                                    ScanIndexForward: false,
+                                    Limit: 1
+                                };
+                                latestRecord = await query_dynamo(letGetLatestRecord);
+                            }
+                            if (latestRecord.Count > 0) {
+                                let parameter_response = master_tag.Items[0].parameter_values.filter(item => item.tag_value == latestRecord.Items[0].kpch_val);
+                                if (parameter_response.length > 0) {
+                                    if (parameter_response[0].is_conditional != undefined && parameter_response[0].is_conditional == true) {
+                                        let getLastValueOfDependentTagParams = {
+                                            TableName: 'dev_kpro_chainhome_master',
+                                            KeyConditionExpression: 'kpch_tag = :kpch_tag',
+                                            ExpressionAttributeValues: {
+                                                ':kpch_tag': latestRecord.Items[0].kpch_tag.split("_")[0] + "_" + parameter_response[0].dependent_tag_id
+                                            },
+                                            ScanIndexForward: false,
+                                            Limit: 1
+                                        };
+                                        let param_value = await query_dynamo(getLastValueOfDependentTagParams);
+                                        if (param_value.Count > 0) {
+                                            if (param_value.Items[0].kpch_val == parameter_response[0].dependent_tag_value) {
+                                                summary_parameters.Items[i].color = parameter_response[0].dependent_color;
+                                                summary_response.push(summary_parameters.Items[i]);
+                                            }
+                                            else {
+                                                summary_parameters.Items[i].color = parameter_response[0].tag_color;
+                                                summary_response.push(summary_parameters.Items[i]);
+                                            }
+                                        }
+                                        else {
+                                            summary_parameters.Items[i].color = parameter_response[0].tag_color;
+                                            summary_response.push(summary_parameters.Items[i]);
+                                        }
+                                    }
+                                    else {
+                                        summary_parameters.Items[i].color = parameter_response[0].tag_color;
+                                        summary_response.push(summary_parameters.Items[i]);
+                                    }
+                                }
+                                else {
+                                    console.log("INVALID VALUE");
+                                }
+                            }
+                            else {
+                                console.log(("iam here"));
+                            }
+                        }
+                        else {
+                            console.log("INVALID CONFGURATION");
+                        }
+                    }
+                    else {
+                        console.log("INVALID TAG");
+                    }
+                }
+            }
+
+            //STEP DATA
+            let getAllPlantsOfOrganizationParams = {
+                TableName: "dev_KPRO_plants",
+                IndexName: "organization_id-internal_plant_name-index",
+                KeyConditionExpression: 'organization_id = :organization_id',
+                FilterExpression: "asset_id = :asset_id",
+                ExpressionAttributeValues: {
+                    ':organization_id': event.organization_id,
+                    ':asset_id': event.asset_id
+                }
+            };
+            let plants = await query_dynamo(getAllPlantsOfOrganizationParams);
+            let step_response = [];
+            for (let i = 0; i < plants.Items.length; i++) {
+                let letGetLatestRecord = {
+                    TableName: "dev_kpro_chainhome_master",
+                    KeyConditionExpression: 'kpch_tag = :kpch_tag',
+                    ExpressionAttributeValues: {
+                        ':kpch_tag': organization.Items[0].organization_code + asset.Items[0].asset_type + "_" + plants.Items[i].plant_tag_id
+                    },
+                    ScanIndexForward: false,
+                    Limit: 1
+                };
+                let latestRecord = await query_dynamo(letGetLatestRecord);
+                if (latestRecord.Count > 0) {
+                    plants.Items[i].plant_steps.map(step => {
+                        if (step.step_tag_value == latestRecord.Items[0].kpch_val) {
+                            step_response.push({
+                                ...plants.Items[i],
+                                step_name: step.step_name,
+                                actual_value: latestRecord.Items[0].kpch_val.toFixed(2),
+                                color: step.step_name.includes("Idle") ? "RED" : "GREEN",
+                                type: "STEP"
+                            });
+                        }
+                    });
+                }
+            }
+            console.log("step_response", step_response)
+            //DAILY LOGS
+            // let retreived_object = JSON.parse(event.body);
+            //var dateArray = new Date().toLocaleString(undefined, { timeZone: 'Asia/Kolkata' }).split(",")[0].split("/");
+            //var IndianDate = dateArray[2] + "-" + dateArray[0] + "-" + dateArray[1];
+            // let IndianDate = retreived_object.date.split("-");
+            // IndianDate = parseInt(IndianDate[0]) +"-"+parseInt(IndianDate[1])+"-"+parseInt(IndianDate[2]);
+            let getTodaysLogParams = {
+                TableName: "dev_KPRO_Daily_log",
+                KeyConditionExpression: '#organization_id__asset_id = :organization_id__asset_id AND #log_date = :log_date',
+                ExpressionAttributeNames: {
+                    '#organization_id__asset_id': 'organization_id__asset_id',
+                    '#log_date': 'log_date'
+                },
+                ExpressionAttributeValues: {
+                    ':organization_id__asset_id': event.organization_id + "__" + event.asset_id,
+                    ':log_date': new Date().toISOString().split('T')[0]
+                }
+            };
+            const latestRecord = await query_dynamo(getTodaysLogParams);
+            //console.log("dailylog", latestRecord);
+            let daily_log_response = {};
+            for (let i = 0; i < plants.Items.length; i++) {
+                let parameter = plants.Items[i].plant_name.toLowerCase();
+                if (latestRecord.Count > 0) {
+                    daily_log_response[plants.Items[i].plant_name] = latestRecord.Items[0][plants.Items[i].plant_name.split(" ").join("").toUpperCase()] || [];
+                    daily_log_response[parameter + "_water_produced"] = Math.round(latestRecord.Items[0][parameter + "_water_produced"] * 100) / 100 || 0;
+                    //console.log(`latestRecord.Items[0][${parameter} + "__recovery_percentage"]`, latestRecord.Items[0][parameter + "__recovery_percentage"]);
+                    if (latestRecord.Items[0][parameter + "_recovery_percentage"] != undefined) {
+                        step_response.push({
+                            ...plants.Items[i],
+                            plant_name: plants.Items[i].plant_name,
+                            actual_value: latestRecord.Items[0][parameter + "_recovery_percentage"],
+                            type: "RECOVERY"
+                        });
+                    }
+                    let sum_value = 0;
+                    if (daily_log_response[plants.Items[i].plant_name].length > 0) {
+                        for (let j = 0; j < daily_log_response[plants.Items[i].plant_name].length; j++) {
+                            let singleObject = daily_log_response[plants.Items[i].plant_name][j];
+                            if (singleObject.stop != undefined) {
+                                sum_value = sum_value + (new Date(singleObject.stop * 1000).getTime() - new Date(singleObject.start * 1000).getTime());
+                            }
+                            if (singleObject.stop == undefined) {
+                                sum_value = sum_value + (new Date().getTime() - new Date(singleObject.start * 1000).getTime());
+                            }
+                        }
+                        sum_value = sum_value / 1000;
+                        daily_log_response[`${plants.Items[i].plant_name.toLowerCase()}_total_hours_of_operation`] = sum_value;
+                    }
+                    else {
+                        daily_log_response[`${plants.Items[i].plant_name.toLowerCase()}_total_hours_of_operation`] = sum_value;
+                    }
+
+                }
+                else {
+                    daily_log_response[plants.Items[i].plant_name] = [];
+                    daily_log_response[parameter + "_water_produced"] = 0;
+                    daily_log_response[plants.Items[i].plant_name + "_total_hours_of_operation"] = 0;
+                }
+            }
+            daily_log_response.type = "DAILY_LOGS";
+            daily_log_response = {
+                ...latestRecord.Items[0],
+                ...daily_log_response
+            };
+            daily_log_response = [daily_log_response];
+
+            // HEART BEAT
+            let getLastHeartBeatDetails = {
+                TableName: 'dev_kpro_chainhome_master',
+                KeyConditionExpression: 'kpch_tag = :kpch_tag',
+                ExpressionAttributeValues: {
+                    ':kpch_tag': organization.Items[0].organization_code + asset.Items[0].asset_type + "_heartbeat"
+                },
+                ScanIndexForward: false,
+                Limit: 2
+            };
+            let heartbeat_data = await query_dynamo(getLastHeartBeatDetails);
+            let getTimeDurationOfHeartBeatForAnOrganization = {
+                TableName: 'dev_KPRO_MasterSettings',
+                KeyConditionExpression: 'organization_id = :organization_id AND master_type = :master_type',
+                ExpressionAttributeValues: {
+                    ':organization_id': organization.Items[0].organization_id,
+                    ':master_type': 'HEART_BEAT'
+                }
+            };
+            let heartbeat_settings = await query_dynamo(getTimeDurationOfHeartBeatForAnOrganization);
+            let heartBeat_response = {
+                organization_id: organization.Items[0].organization_id,
+                asset_id: asset.Items[0].asset_id,
+                color: "GREEN",
+                type: "HEARTBEAT"
+            };
+            if (heartbeat_settings.Count > 0 && heartbeat_data.Items[1].kpch_tist - heartbeat_data.Items[0].kpch_tist > 10) {
+                let difference = heartbeat_data.Items[1].kpch_tist - heartbeat_data.Items[0].kpch_tist;
+                if (difference > heartbeat_settings.Items[0].Minimum_Minutes && difference < heartbeat_settings.Items[0].Maximum_Minutes) {
+                    heartBeat_response.color = "YELLOW";
+                }
+                else if (difference > heartbeat_settings.Items[0].Maximum_Minutes) {
+                    heartBeat_response.color = "RED";
+                }
+            }
+            step_response.push(heartBeat_response);
+            let response = { items: op_response.concat(summary_response, step_response, daily_log_response) };
+            // let daily_log_response = [];
+            // if (latestRecord.Count > 0) {
+            //     daily_log_response = latestRecord.Items;
+            //     if (response[0].uf_water_produced == undefined) {
+            //         response[0].uf_water_produced = 0;
+            //     }
+            //     if (response[0].ro_water_produced == undefined) {
+            //         response[0].ro_water_produced = 0;
+            //     }
+            //     if (response[0].RO == undefined) {
+            //         response[0].RO = [];
+            //     }
+            //     if (response[0].UF == undefined) {
+            //         response[0].UF = [];
+            //     }
+            //     let sum_value = 0;
+            //     if (response[0].RO.length > 0) {
+            //         for (let i = 0; i < response[0].RO.length; i++) {
+            //             let singleObject = response[0].RO[i];
+            //             if (singleObject.stop != undefined) {
+            //                 sum_value = sum_value + (new Date(singleObject.stop * 1000).getTime() - new Date(singleObject.start * 1000).getTime());
+            //             }
+            //             if (singleObject.stop == undefined) {
+            //                 sum_value = sum_value + (new Date().getTime() - new Date(singleObject.start * 1000).getTime());
+            //             }
+            //         }
+            //     }
+            //     if (response[0].UF.length > 0) {
+            //         for (let i = 0; i < response[0].UF.length; i++) {
+            //             let singleObject = response[0].UF[i];
+            //             if (singleObject.stop != undefined) {
+            //                 sum_value = sum_value + (new Date(singleObject.stop * 1000).getTime() - new Date(singleObject.start * 1000).getTime());
+            //             }
+            //             if (singleObject.stop == undefined) {
+            //                 sum_value = sum_value + (new Date().getTime() - new Date(singleObject.start * 1000).getTime());
+            //             }
+            //         }
+            //     }
+            //     sum_value = sum_value / 1000;
+            //     response[0].Total_hours_of_operation_till_now = sum_value;
+            // }
+            // else {
+            //     // let dateArray = new Date().toLocaleString(undefined, { timeZone: 'Asia/Kolkata' }).split(",")[0].split("/");
+            //     // IndianDate = dateArray[2] + "-" + dateArray[0] + "-" + dateArray[1];
+            //     response.push({
+            //         uf_water_produced: 0,
+            //         date: retreived_object.date,
+            //         ro_water_produced: 0,
+            //         RO: [],
+            //         UF: [],
+            //         Total_hours_of_operation_till_now: 0
+            //     });
+            // }
+            return { status: 'SUCCESS', data: response };
+        }
+        else {
+            return "Invalid Asset ID";
+        }
+    }
+    else {
+        return "Invalid Organization ID";
+    }
+};
